@@ -22,7 +22,7 @@
 
 
 #define DNS2TCP_VER "dns2tcp v1.1.0"
-#define ENABLE_DUMP 
+//#define ENABLE_DUMP 
 
 
 #ifndef IPV6_V6ONLY
@@ -61,7 +61,7 @@ typedef struct sockaddr_in6 skaddr6_t;
     do {\
         char buf[MAX_LOG_LEN] = {0};\
         struct tm *tm = localtime(&(time_t){time(NULL)});\
-        snprintf(buf, MAX_LOG_LEN - 1, "%04d-%02d-%02d %02d:%02d:%02d INF:" fmt "\n", \
+        snprintf(buf, MAX_LOG_LEN - 1, "%04d-%02d-%02d %02d:%02d:%02d [dns2tcp]:" fmt "\n", \
                 tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,\
                 tm->tm_hour, tm->tm_min, tm->tm_sec,\
                 ##__VA_ARGS__);\
@@ -73,7 +73,7 @@ typedef struct sockaddr_in6 skaddr6_t;
 #define LOGERR(fmt, ...)                                                    \
     do {                                                                    \
         struct tm *tm = localtime(&(time_t){time(NULL)});                   \
-        printf("\e[1;35m%04d-%02d-%02d %02d:%02d:%02d ERR:\e[0m " fmt "\n", \
+        printf("\e[1;35m%04d-%02d-%02d %02d:%02d:%02d [dns2tcp]:\e[0m " fmt "\n", \
                 tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,            \
                 tm->tm_hour,        tm->tm_min,     tm->tm_sec,             \
                 ##__VA_ARGS__);                                             \
@@ -87,54 +87,38 @@ void hexdump(void *pSrc, int len) {
     int thisline;
     int offset;
 
-
     line = (unsigned char *)pSrc;
     offset = 0;
-
 
     while (offset < len) {
         printf("%04x ", offset);
         thisline = len - offset;
-
-
-
 
         if (thisline > 16)
         {
             thisline = 16;
         }
 
-
-
-
         for (i = 0; i < thisline; i++)
         {
             printf("%02x ", line[i]);
         }
-
-
-
 
         for (; i < 16; i++)
         {
             printf("   ");
         }
 
-
-
-
         for (i = 0; i < thisline; i++)
         {
             printf("%c", (line[i] >= 0x20 && line[i] < 0x7f) ? line[i] : '.');
         }
 
-
-
-
         printf("\n");
         offset += thisline;
         line += thisline;
     }
+    printf("\n");
 }
 
 
@@ -158,6 +142,7 @@ enum {
 static bool       g_verbose                 = false;
 static uint8_t    g_options                 = 0;
 static uint8_t    g_syn_maxcnt              = 0;
+static uint16_t    g_fping_timeout          = 200;
 static int        g_udp_sockfd              = -1;
 static char       g_listen_ipstr[IP6STRLEN] = {0};
 static portno_t   g_listen_portno           = 0;
@@ -281,6 +266,7 @@ static void print_command_help(void) {
            " -L <ip#port>            udp listen address, this is required\n"
            " -R <ip#port>            tcp remote address, this is required\n"
            " -s <syncnt>             set TCP_SYNCNT(max) for remote socket\n"
+           " -t <fping timeout>      set timeout(ms) to check ipv6 address via fping\n"
            " -4                      request for type A(ipv4) only, ignore AAAA(ipv6) reqeust\n"
            " -6                      enable IPV6_V6ONLY for listen socket\n"
            " -r                      enable SO_REUSEPORT for listen socket\n"
@@ -363,7 +349,7 @@ static void parse_command_args(int argc, char *argv[]) {
 
     opterr = 0;
     int shortopt = -1;
-    const char *optstr = "L:R:s:46rafvVh";
+    const char *optstr = "L:R:s:t:46rafvVh";
     while ((shortopt = getopt(argc, argv, optstr)) != -1) {
         printf("[parse_command_args] shortopt: %d, optarg:%s\n", shortopt, optarg);
         switch (shortopt) {
@@ -387,6 +373,10 @@ static void parse_command_args(int argc, char *argv[]) {
                     printf("[parse_command_args] invalid tcp syn cnt: %s\n", optarg);
                     goto PRINT_HELP_AND_EXIT;
                 }
+                break;
+            case 't':
+                g_fping_timeout = strtoul(optarg, NULL, 10);
+                LOGINF("[parse_command_args] fping timeout:%u", g_fping_timeout);
                 break;
             case '4':
                 g_options |= OPT_IPV4_ONLY;
@@ -503,7 +493,7 @@ static void udp_recvmsg_cb(evloop_t *evloop, evio_t *watcher __attribute__((unus
     IF_VERBOSE {
         portno_t portno;
         parse_socket_addr(&tcpw->srcaddr, g_ipstr_buf, &portno);
-        LOGINF("[udp_recvmsg_cb] recv from %s#%hu, nrecv:%zd", g_ipstr_buf, portno, nrecv);
+        //LOGINF("[udp_recvmsg_cb] recv from %s#%hu, nrecv:%zd", g_ipstr_buf, portno, nrecv);
     }
     uint16_t *msglen_ptr = (void *)tcpw->buffer;
 
@@ -526,6 +516,7 @@ static void udp_recvmsg_cb(evloop_t *evloop, evio_t *watcher __attribute__((unus
     tcpw->nrcvsnd = 0;
 
 #ifdef ENABLE_DUMP
+    IF_VERBOSE LOGINF("udp received buffer:\n");
     hexdump(tcpw->buffer, nrecv);
 #endif
 
@@ -608,7 +599,7 @@ static void tcp_sendmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attri
         free(watcher);
         return;
     }
-    IF_VERBOSE LOGINF("[tcp_sendmsg_cb] send to %s#%hu, nsend:%zd", g_remote_ipstr, g_remote_portno, nsend);
+    //IF_VERBOSE LOGINF("[tcp_sendmsg_cb] send to %s#%hu, nsend:%zd", g_remote_ipstr, g_remote_portno, nsend);
     tcpw->nrcvsnd += nsend;
     if (tcpw->nrcvsnd >= datalen) {
         tcpw->nrcvsnd = 0; /* reset to zero for recv data */
@@ -627,30 +618,43 @@ int check_ipv6_addr(char* answer) {
         assert(len == 16);
         char ip[64] = {0};
         int cur_pos = 0;
-        for (int i=0; i<len; i++) {
-            sprintf(ip + cur_pos, "%02x:", answer[12 + i]);
+        for (int i=0; i<len; i+=2) {
+            sprintf(ip + cur_pos, "%02x", (unsigned int)(answer[12 + i] & 0xFF));
             cur_pos += 2;
-            if (i % 2 == 1 && i != len - 1) {
-                sprintf(ip + cur_pos, "%s", ":");
-                cur_pos += 1;
-            }
+            sprintf(ip + cur_pos, "%02x", (unsigned int)(answer[12 + i + 1] & 0xFF));
+            cur_pos += 2;
+            sprintf(ip + cur_pos, "%s", ":");
+            cur_pos += 1;
         }
-        ip[cur_pos] = '\0';
-        
-        char cmd[256] = {0};
-        sprintf(cmd, "fping -c1 -t300 %s > /dev/null 2>&1", ip);
-        int res = system(cmd);
-        if (res == 0){
-            IF_VERBOSE LOGINF("%s is active", ip);
-            // do nothing, return the original info
+        ip[cur_pos - 1] = '\0'; // -1 to overwrite the last :
+        IF_VERBOSE LOGINF("got ipv6 address:%s", ip);
+
+        if (!(g_options & OPT_IPV4_ONLY)) {
+            if (g_fping_timeout > 0) { 
+                char cmd[256] = {0};
+                sprintf(cmd, "fping -c1 -t%d %s > /dev/null 2>&1", g_fping_timeout, ip);
+                int res = system(cmd);
+                if (res == 0){
+                    IF_VERBOSE LOGINF("the ipv6 address is reachable");
+                    // do nothing, return the original info
+                    return len + 12;
+                } else {
+                    IF_VERBOSE LOGINF("the ipv6 address is not reachable with timeout:%u", g_fping_timeout);
+                } 
+            } else {
+                // do nothing, return the original info
+                IF_VERBOSE LOGINF("fping timeout is 0, skip check");
+                return len + 12;
+            }
         } else {
-            // replace the fake ip ::2
-            IF_VERBOSE LOGINF("%s is not active", ip);
-            for (int i=0; i<len; i++) {
-                answer[12 + i] = 0;
-            }
-            answer[12 + len -1] = 0x02;
+            IF_VERBOSE LOGINF("ipv4_only is set, replace it with ::1");
         }
+
+        // replace the fake ip ::1
+        for (int i=0; i<len; i++) {
+            answer[12 + i] = 0;
+        }
+        answer[12 + len - 1] = 0x01;
     }
     return len + 12;
 }
@@ -670,10 +674,11 @@ static void tcp_recvmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attri
         goto FREE_TCP_WATCHER;
     }
     tcpw->nrcvsnd += nrecv;
-    IF_VERBOSE LOGINF("[tcp_recvmsg_cb] recv from %s#%hu, nrecv:%zd", g_remote_ipstr, g_remote_portno, nrecv);
+    //IF_VERBOSE LOGINF("[tcp_recvmsg_cb] recv from %s#%hu, nrecv:%zd", g_remote_ipstr, g_remote_portno, nrecv);
     if (tcpw->nrcvsnd < 2 || tcpw->nrcvsnd < 2 + ntohs(*(uint16_t *)buffer)) return;
 
 #ifdef ENABLE_DUMP
+    IF_VERBOSE LOGINF("tcp received response buffer:\n");
     hexdump(tcpw->buffer, nrecv);
 #endif
 
@@ -693,7 +698,7 @@ static void tcp_recvmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attri
     // add one extra char for '\0' after domain name
     uint16_t req_type = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 12 + strlen(domain) + 1));
 
-    IF_VERBOSE LOGINF("response dns for:%s with type:%d\n, buffer:%p", domain, req_type, tcpw->buffer);
+    IF_VERBOSE LOGINF("response dns for:%s with type:%d, buffer:%p", domain, req_type, tcpw->buffer);
     IF_VERBOSE LOGINF("rr_cnt:%d, authority_rr_cnt:%d, additional_rr_cnt:%d", rr_cnt, authority_rr_cnt, additional_rr_cnt);
 
     char* answer = (char*)tcpw->buffer + 2 + 12 + strlen(domain) + 1 + 4;
@@ -709,11 +714,12 @@ static void tcp_recvmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attri
     }
 #endif
 
-    uint16_t msg_len = ntohs(*(uint16_t *)buffer);
 #ifdef ENABLE_DUMP
+    IF_VERBOSE LOGINF("udp send back buffer:\n");
+    uint16_t msg_len = ntohs(*(uint16_t *)buffer);
     hexdump(tcpw->buffer + 2, msg_len);
 #endif
-    IF_VERBOSE LOGINF("buffer:%p, answer:%p, msg_len:%d", buffer, answer, msg_len);
+    //IF_VERBOSE LOGINF("buffer:%p, answer:%p, msg_len:%d", buffer, answer, msg_len);
 
     //assert(answer == buffer + 2 + msg_len);
 #if 0
@@ -745,7 +751,7 @@ static void tcp_recvmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attri
         IF_VERBOSE {
             portno_t portno;
             parse_socket_addr(&tcpw->srcaddr, g_ipstr_buf, &portno);
-            LOGINF("[tcp_recvmsg_cb] send to %s#%hu, nsend:%zd", g_ipstr_buf, portno, nsend);
+            //LOGINF("[tcp_recvmsg_cb] send to %s#%hu, nsend:%zd", g_ipstr_buf, portno, nsend);
         }
     }
 FREE_TCP_WATCHER:
