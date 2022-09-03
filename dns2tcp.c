@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <assert.h>
+#include <syslog.h>
 #include <ctype.h>
 #include <stdbool.h>
 #include <string.h>
@@ -20,6 +22,7 @@
 
 
 #define DNS2TCP_VER "dns2tcp v1.1.0"
+#define ENABLE_DUMP 
 
 
 #ifndef IPV6_V6ONLY
@@ -52,14 +55,18 @@ typedef struct sockaddr_in6 skaddr6_t;
 
 #define IF_VERBOSE if (g_verbose)
 
+#define MAX_LOG_LEN 1024
 
-#define LOGINF(fmt, ...)                                                    \
-    do {                                                                    \
-        struct tm *tm = localtime(&(time_t){time(NULL)});                   \
-        printf("\e[1;32m%04d-%02d-%02d %02d:%02d:%02d INF:\e[0m " fmt "\n", \
-                tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,            \
-                tm->tm_hour,        tm->tm_min,     tm->tm_sec,             \
-                ##__VA_ARGS__);                                             \
+#define LOGINF(fmt, ...)\
+    do {\
+        char buf[MAX_LOG_LEN] = {0};\
+        struct tm *tm = localtime(&(time_t){time(NULL)});\
+        snprintf(buf, MAX_LOG_LEN - 1, "%04d-%02d-%02d %02d:%02d:%02d INF:" fmt "\n", \
+                tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,\
+                tm->tm_hour, tm->tm_min, tm->tm_sec,\
+                ##__VA_ARGS__);\
+        printf("%s", buf);\
+        syslog(LOG_INFO|LOG_USER,"%s", buf);\
     } while (0)
 
 
@@ -70,9 +77,8 @@ typedef struct sockaddr_in6 skaddr6_t;
                 tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,            \
                 tm->tm_hour,        tm->tm_min,     tm->tm_sec,             \
                 ##__VA_ARGS__);                                             \
+        syslog(LOG_ERR|LOG_USER,"[%s](%d)" fmt , __func__, __LINE__, ##__VA_ARGS__);\
     } while (0)
-
-
 
 
 void hexdump(void *pSrc, int len) {
@@ -504,22 +510,24 @@ static void udp_recvmsg_cb(evloop_t *evloop, evio_t *watcher __attribute__((unus
 #if 1
     char domain[256] = {0};
     strcpy(domain, (const char*)tcpw->buffer + 2 + 12);
-    char* ch = domain + 1;
+    char* ch = domain + 1; //skip the length field
     while(*ch != '\0') {
         if (!isprint(*ch)) {
-            *ch = '.';
+            *ch = '.';//replace other length field to .
         }
         ++ch;
     }
     uint16_t req_type = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 12 + strlen(domain) + 1));
-    LOGINF("request dns for:%s with type:%s\n", domain, req_type == 1 ? "A" : "AAAA");
+    IF_VERBOSE LOGINF("request dns for:%s with type:%s\n", domain, req_type == 1 ? "A" : "AAAA");
 #endif
 
     *msglen_ptr = htons(nrecv); /* msg length */
     nrecv += 2; /* msglen + msgbuf */
     tcpw->nrcvsnd = 0;
 
-    //hexdump(tcpw->buffer, nrecv);
+#ifdef ENABLE_DUMP
+    hexdump(tcpw->buffer, nrecv);
+#endif
 
     int sockfd = socket(g_remote_skaddr.sin6_family, SOCK_STREAM, 0);
     if (sockfd < 0) {
@@ -611,10 +619,45 @@ static void tcp_sendmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attri
 }
 
 
+int check_ipv6_addr(char* answer) {
+    uint16_t type = ntohs(*(uint16_t*)(answer+ 2));
+    uint16_t len = ntohs(*(uint16_t*)(answer+ 10));
+    IF_VERBOSE LOGINF("check_ipv6_addr answer:%p, type:%d, len:%d", answer, type, len);
+    if (type == 28) {// IPv6 address
+        assert(len == 16);
+        char ip[64] = {0};
+        int cur_pos = 0;
+        for (int i=0; i<len; i++) {
+            sprintf(ip + cur_pos, "%02x:", answer[12 + i]);
+            cur_pos += 2;
+            if (i % 2 == 1 && i != len - 1) {
+                sprintf(ip + cur_pos, "%s", ":");
+                cur_pos += 1;
+            }
+        }
+        ip[cur_pos] = '\0';
+        
+        char cmd[256] = {0};
+        sprintf(cmd, "fping -c1 -t300 %s > /dev/null 2>&1", ip);
+        int res = system(cmd);
+        if (res == 0){
+            IF_VERBOSE LOGINF("%s is active", ip);
+            // do nothing, return the original info
+        } else {
+            // replace the fake ip ::2
+            IF_VERBOSE LOGINF("%s is not active", ip);
+            for (int i=0; i<len; i++) {
+                answer[12 + i] = 0;
+            }
+            answer[12 + len -1] = 0x02;
+        }
+    }
+    return len + 12;
+}
+
 static void tcp_recvmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attribute__((unused))) {
     tcpwatcher_t *tcpw = (void *)watcher;
     void *buffer = tcpw->buffer;
-
 
     ssize_t nrecv = recv(watcher->fd, buffer + tcpw->nrcvsnd, 2 + UDPDGRAM_MAXSIZ - tcpw->nrcvsnd, 0);
     if (nrecv < 0) {
@@ -630,7 +673,9 @@ static void tcp_recvmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attri
     IF_VERBOSE LOGINF("[tcp_recvmsg_cb] recv from %s#%hu, nrecv:%zd", g_remote_ipstr, g_remote_portno, nrecv);
     if (tcpw->nrcvsnd < 2 || tcpw->nrcvsnd < 2 + ntohs(*(uint16_t *)buffer)) return;
 
-    //hexdump(tcpw->buffer, nrecv);
+#ifdef ENABLE_DUMP
+    hexdump(tcpw->buffer, nrecv);
+#endif
 
 #if 1
     char domain[256] = {0};
@@ -642,9 +687,36 @@ static void tcp_recvmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attri
         }
         ++ch;
     }
+    uint16_t rr_cnt = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 6));
+    uint16_t authority_rr_cnt = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 8));
+    uint16_t additional_rr_cnt = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 10));
+    // add one extra char for '\0' after domain name
     uint16_t req_type = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 12 + strlen(domain) + 1));
-    LOGINF("response dns for:%s with type:%s\n", domain, req_type == 1 ? "A" : "AAAA");
+
+    IF_VERBOSE LOGINF("response dns for:%s with type:%d\n, buffer:%p", domain, req_type, tcpw->buffer);
+    IF_VERBOSE LOGINF("rr_cnt:%d, authority_rr_cnt:%d, additional_rr_cnt:%d", rr_cnt, authority_rr_cnt, additional_rr_cnt);
+
+    char* answer = (char*)tcpw->buffer + 2 + 12 + strlen(domain) + 1 + 4;
+    for (int i=0; i<rr_cnt; i++) {
+        answer += check_ipv6_addr(answer);
+    }
+#if 0
+    for (int i=0; i<authority_rr_cnt; i++) {
+        answer += check_ipv6_addr(answer);
+    }
+    for (int i=0; i<additional_rr_cnt; i++) {
+        answer += check_ipv6_addr(answer);
+    }
+#endif
+
     uint16_t msg_len = ntohs(*(uint16_t *)buffer);
+#ifdef ENABLE_DUMP
+    hexdump(tcpw->buffer + 2, msg_len);
+#endif
+    IF_VERBOSE LOGINF("buffer:%p, answer:%p, msg_len:%d", buffer, answer, msg_len);
+
+    //assert(answer == buffer + 2 + msg_len);
+#if 0
     if ((g_options & OPT_IPV4_ONLY && req_type == 28) && tcpw->buffer[9] > 0) {
         printf("ignore AAAA type response for:%s\n", domain);
         tcpw->buffer[9] = 1;
@@ -658,7 +730,7 @@ static void tcp_recvmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attri
         msg_len = 12 + strlen(domain) + 1 + 4 + 2 + 4 + 4 + 2 + 16;
         tcpw->buffer[1] = msg_len;
     }
-    //hexdump(tcpw->buffer + 2, msg_len);
+#endif
 #endif
 
 
