@@ -509,6 +509,7 @@ static void udp_recvmsg_cb(evloop_t *evloop, evio_t *watcher __attribute__((unus
     }
     uint16_t req_type = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 12 + strlen(domain) + 1));
     IF_VERBOSE LOGINF("request dns for:%s with type:%s\n", domain, req_type == 1 ? "A" : "AAAA");
+    if (req_type == 28 && (g_options & OPT_IPV4_ONLY)) return;
 #endif
 
     *msglen_ptr = htons(nrecv); /* msg length */
