@@ -59,25 +59,23 @@ typedef struct sockaddr_in6 skaddr6_t;
 
 #define LOGINF(fmt, ...)\
     do {\
-        char buf[MAX_LOG_LEN] = {0};\
         struct tm *tm = localtime(&(time_t){time(NULL)});\
-        snprintf(buf, MAX_LOG_LEN - 1, "%04d-%02d-%02d %02d:%02d:%02d [dns2tcp]:" fmt "\n", \
+        printf("%04d-%02d-%02d %02d:%02d:%02d " fmt "\n", \
                 tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,\
                 tm->tm_hour, tm->tm_min, tm->tm_sec,\
                 ##__VA_ARGS__);\
-        printf("%s", buf);\
-        syslog(LOG_INFO|LOG_USER,"%s", buf);\
+        syslog(LOG_INFO|LOG_USER,"[dns2tcp] " fmt, ##__VA_ARGS__);\
     } while (0)
 
 
 #define LOGERR(fmt, ...)                                                    \
     do {                                                                    \
         struct tm *tm = localtime(&(time_t){time(NULL)});                   \
-        printf("\e[1;35m%04d-%02d-%02d %02d:%02d:%02d [dns2tcp]:\e[0m " fmt "\n", \
+        printf("\e[1;35m%04d-%02d-%02d %02d:%02d:%02d\e[0m " fmt "\n", \
                 tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,            \
                 tm->tm_hour,        tm->tm_min,     tm->tm_sec,             \
                 ##__VA_ARGS__);                                             \
-        syslog(LOG_ERR|LOG_USER,"[%s](%d)" fmt , __func__, __LINE__, ##__VA_ARGS__);\
+        syslog(LOG_ERR|LOG_USER,"[dns2tcp] " fmt, ##__VA_ARGS__);\
     } while (0)
 
 
@@ -509,7 +507,8 @@ static void udp_recvmsg_cb(evloop_t *evloop, evio_t *watcher __attribute__((unus
     }
     uint16_t req_type = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 12 + strlen(domain) + 1));
     IF_VERBOSE LOGINF("request dns for:%s with type:%s\n", domain, req_type == 1 ? "A" : "AAAA");
-    if (req_type == 28 && (g_options & OPT_IPV4_ONLY)) return;
+    if (req_type == 28 && (g_options & OPT_IPV4_ONLY)) {
+    }
 #endif
 
     *msglen_ptr = htons(nrecv); /* msg length */
@@ -610,54 +609,37 @@ static void tcp_sendmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attri
     }
 }
 
+bool check_domain_black_list(char* domain) {
+    if (strstr(domain, "disney")) return true;
+    if (strstr(domain, "netflix")) return true;
+    if (strstr(domain, "dssott")) return true;
+    return false;
+}
 
-int check_ipv6_addr(char* answer) {
-    uint16_t type = ntohs(*(uint16_t*)(answer+ 2));
-    uint16_t len = ntohs(*(uint16_t*)(answer+ 10));
-    IF_VERBOSE LOGINF("check_ipv6_addr answer:%p, type:%d, len:%d", answer, type, len);
-    if (type == 28) {// IPv6 address
-        assert(len == 16);
-        char ip[64] = {0};
-        int cur_pos = 0;
-        for (int i=0; i<len; i+=2) {
-            sprintf(ip + cur_pos, "%02x", (unsigned int)(answer[12 + i] & 0xFF));
-            cur_pos += 2;
-            sprintf(ip + cur_pos, "%02x", (unsigned int)(answer[12 + i + 1] & 0xFF));
-            cur_pos += 2;
-            sprintf(ip + cur_pos, "%s", ":");
-            cur_pos += 1;
-        }
-        ip[cur_pos - 1] = '\0'; // -1 to overwrite the last :
-        IF_VERBOSE LOGINF("got ipv6 address:%s", ip);
+void remove_unreachable_ipv6_answer(uint8_t* resp_buf) {
+    *(uint16_t*)(resp_buf + 2 + 6) = 0;
+    *(uint16_t*)(resp_buf + 2 + 8) = 0;
+    *(uint16_t*)(resp_buf + 2 + 10) = 0;
+}
 
-        if (!(g_options & OPT_IPV4_ONLY)) {
-            if (g_fping_timeout > 0) { 
-                char cmd[256] = {0};
-                sprintf(cmd, "fping -c1 -t%d %s > /dev/null 2>&1", g_fping_timeout, ip);
-                int res = system(cmd);
-                if (res == 0){
-                    IF_VERBOSE LOGINF("the ipv6 address is reachable");
-                    // do nothing, return the original info
-                    return len + 12;
-                } else {
-                    IF_VERBOSE LOGINF("the ipv6 address is not reachable with timeout:%u", g_fping_timeout);
-                } 
-            } else {
-                // do nothing, return the original info
-                IF_VERBOSE LOGINF("fping timeout is 0, skip check");
-                return len + 12;
-            }
+bool check_ipv6_addr_reachable(const char* domain, const char* ip) {
+    if (g_fping_timeout > 0) { 
+        char cmd[256] = {0};
+        sprintf(cmd, "fping -c1 -t%d %s > /dev/null 2>&1", g_fping_timeout, ip);
+        int res = system(cmd);
+        if (res == 0){
+            IF_VERBOSE LOGINF("[%s] [%s] is reachable", domain, ip);
+            // do nothing, return the original info
+            return true;
         } else {
-            IF_VERBOSE LOGINF("ipv4_only is set, replace it with ::1");
-        }
-
-        // replace the fake ip ::1
-        for (int i=0; i<len; i++) {
-            answer[12 + i] = 0;
-        }
-        answer[12 + len - 1] = 0x01;
+            IF_VERBOSE LOGINF("[%s] [%s] is not reachable with timeout:%u", domain, ip, g_fping_timeout);
+            return false;
+        } 
+    } else {
+        // do nothing, return the original info
+        IF_VERBOSE LOGINF("fping timeout is 0, skip check");
+        return true;
     }
-    return len + 12;
 }
 
 static void tcp_recvmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attribute__((unused))) {
@@ -693,51 +675,55 @@ static void tcp_recvmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attri
         }
         ++ch;
     }
-    uint16_t rr_cnt = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 6));
-    uint16_t authority_rr_cnt = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 8));
-    uint16_t additional_rr_cnt = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 10));
+
     // add one extra char for '\0' after domain name
     uint16_t req_type = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 12 + strlen(domain) + 1));
+    uint16_t rr_cnt = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 6));
 
-    IF_VERBOSE LOGINF("response dns for:%s with type:%d, buffer:%p", domain, req_type, tcpw->buffer);
-    IF_VERBOSE LOGINF("rr_cnt:%d, authority_rr_cnt:%d, additional_rr_cnt:%d", rr_cnt, authority_rr_cnt, additional_rr_cnt);
+    if (req_type == 28) {
+        char* answer = (char*)tcpw->buffer + 2 + 12 + strlen(domain) + 1 + 4;
+        for (int i=0; i<rr_cnt; i++) {
+            uint16_t answer_type = ntohs(*(uint16_t*)(answer + 2));
+            uint16_t answer_len = ntohs(*(uint16_t*)(answer + 10));
+            //IF_VERBOSE LOGINF("answer type:%u, answer_len:%u", answer_type, answer_len);
+            if (answer_type != 28) {
+                answer += (12 + answer_len);
+                continue;
+            }
+            
+            assert(answer_len == 16);
+            char ip[64] = {0};
+            int cur_pos = 0;
+            for (int i=0; i<answer_len; i+=2) {
+                sprintf(ip + cur_pos, "%02x", (unsigned int)(answer[12 + i] & 0xFF));
+                cur_pos += 2;
+                sprintf(ip + cur_pos, "%02x", (unsigned int)(answer[12 + i + 1] & 0xFF));
+                cur_pos += 2;
+                sprintf(ip + cur_pos, "%s", ":");
+                cur_pos += 1;
+            }
+            ip[cur_pos - 1] = '\0'; // -1 to overwrite the last :
+            IF_VERBOSE LOGINF("[%s] got ipv6 address:%s", domain, ip);
 
-    char* answer = (char*)tcpw->buffer + 2 + 12 + strlen(domain) + 1 + 4;
-    for (int i=0; i<rr_cnt; i++) {
-        answer += check_ipv6_addr(answer);
+            if ((g_options & OPT_IPV4_ONLY) || 
+                check_domain_black_list(domain) ||
+                (g_fping_timeout > 0 && !check_ipv6_addr_reachable(domain, ip)))  {
+                IF_VERBOSE LOGINF("[%s] ipv4_only is set or in black list or the ip is unreachable, remove answer", domain);
+                remove_unreachable_ipv6_answer(tcpw->buffer);
+            } 
+            answer += (12 + answer_len);
+        }
     }
-#if 0
-    for (int i=0; i<authority_rr_cnt; i++) {
-        answer += check_ipv6_addr(answer);
-    }
-    for (int i=0; i<additional_rr_cnt; i++) {
-        answer += check_ipv6_addr(answer);
-    }
-#endif
+
+    rr_cnt = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 6));
+    IF_VERBOSE LOGINF("[%s] response with type:%d rr_cnt:%u", domain, req_type, rr_cnt);
 
 #ifdef ENABLE_DUMP
     IF_VERBOSE LOGINF("udp send back buffer:\n");
     uint16_t msg_len = ntohs(*(uint16_t *)buffer);
     hexdump(tcpw->buffer + 2, msg_len);
 #endif
-    //IF_VERBOSE LOGINF("buffer:%p, answer:%p, msg_len:%d", buffer, answer, msg_len);
 
-    //assert(answer == buffer + 2 + msg_len);
-#if 0
-    if ((g_options & OPT_IPV4_ONLY && req_type == 28) && tcpw->buffer[9] > 0) {
-        printf("ignore AAAA type response for:%s\n", domain);
-        tcpw->buffer[9] = 1;
-        tcpw->buffer[2 + 12 + strlen(domain) + 1 + 4 + 2 ] = 0;
-        tcpw->buffer[2 + 12 + strlen(domain) + 1 + 4 + 2 + 1] = 0x1c;
-        tcpw->buffer[2 + 12 + strlen(domain) + 1 + 4 + 2 + 2] = 0;
-        tcpw->buffer[2 + 12 + strlen(domain) + 1 + 4 + 2 + 2 + 1] = 1;
-        tcpw->buffer[2 + 12 + strlen(domain) + 1 + 4 + 2 + 4 + 4 + 1] = 16;
-        tcpw->buffer[2 + 12 + strlen(domain) + 1 + 4 + 2 + 4 + 4 + 2 + 15] = 1;
-        memset(tcpw->buffer + 2 + 12 + strlen(domain) + 1 + 4 + 2 + 4 + 4 + 2, 0, 15);
-        msg_len = 12 + strlen(domain) + 1 + 4 + 2 + 4 + 4 + 2 + 16;
-        tcpw->buffer[1] = msg_len;
-    }
-#endif
 #endif
 
 
