@@ -64,7 +64,7 @@ typedef struct sockaddr_in6 skaddr6_t;
                 tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,\
                 tm->tm_hour, tm->tm_min, tm->tm_sec,\
                 ##__VA_ARGS__);\
-        syslog(LOG_INFO|LOG_USER,"[dns2tcp] " fmt, ##__VA_ARGS__);\
+        syslog(LOG_INFO|LOG_USER,"[dns2tcp] " fmt , ##__VA_ARGS__);\
     } while (0)
 
 
@@ -75,7 +75,7 @@ typedef struct sockaddr_in6 skaddr6_t;
                 tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,            \
                 tm->tm_hour,        tm->tm_min,     tm->tm_sec,             \
                 ##__VA_ARGS__);                                             \
-        syslog(LOG_ERR|LOG_USER,"[dns2tcp] " fmt, ##__VA_ARGS__);\
+        syslog(LOG_ERR|LOG_USER,"[dns2tcp] " fmt , ##__VA_ARGS__);\
     } while (0)
 
 
@@ -478,6 +478,62 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
+int get_domain(const char* buf, char* domain) {
+    //skip the byte which indicats the length of first part of the domain
+    strcpy(domain, buf + 2 + 12 + 1);
+    char* ch = domain;
+    while(*ch != '\0') {
+        if (!isprint(*ch)) {
+            *ch = '.';
+        }
+        ++ch;
+    }
+    // add back the first byte which indicats the length of first part of the domain;
+    // add the last '\0' byte
+    return strlen(domain) + 1 + 1;
+}
+
+bool check_domain_black_list(char* domain) {
+    if (strstr(domain, "disney")) return true;
+    if (strstr(domain, "netflix")) return true;
+    if (strstr(domain, "dssott")) return true;
+    return false;
+}
+
+void remove_unreachable_ipv6_answer(uint8_t* resp_buf, char* answer, uint16_t answer_len, int answer_idx) {
+    *(uint16_t*)(resp_buf + 2 + 6) = 0;
+    *(uint16_t*)(resp_buf + 2 + 8) = 0;
+    *(uint16_t*)(resp_buf + 2 + 10) = 0;
+
+#if 1
+    *(uint16_t*)(resp_buf + 2 + 6) = (answer_idx + 1) << 8;
+    // replace the fake ip ::1
+    for (int i=0; i<answer_len; i++) {
+        answer[12 + i] = 0;
+    }
+    answer[12 + answer_len - 1] = 0x01;
+#endif
+}
+
+bool check_ipv6_addr_reachable(const char* domain, const char* ip) {
+    if (g_fping_timeout > 0) { 
+        char cmd[256] = {0};
+        sprintf(cmd, "fping -c1 -t%d %s > /dev/null 2>&1", g_fping_timeout, ip);
+        int res = system(cmd);
+        if (res == 0){
+            IF_VERBOSE LOGINF("[%s] [%s] is reachable", domain, ip);
+            // do nothing, return the original info
+            return true;
+        } else {
+            IF_VERBOSE LOGINF("[%s] [%s] is not reachable with timeout:%u", domain, ip, g_fping_timeout);
+            return false;
+        } 
+    } else {
+        // do nothing, return the original info
+        IF_VERBOSE LOGINF("fping timeout is 0, skip check");
+        return true;
+    }
+}
 
 static void udp_recvmsg_cb(evloop_t *evloop, evio_t *watcher __attribute__((unused)), int events __attribute__((unused))) {
     tcpwatcher_t *tcpw = malloc(sizeof(*tcpw));
@@ -495,21 +551,10 @@ static void udp_recvmsg_cb(evloop_t *evloop, evio_t *watcher __attribute__((unus
     }
     uint16_t *msglen_ptr = (void *)tcpw->buffer;
 
-#if 1
     char domain[256] = {0};
-    strcpy(domain, (const char*)tcpw->buffer + 2 + 12);
-    char* ch = domain + 1; //skip the length field
-    while(*ch != '\0') {
-        if (!isprint(*ch)) {
-            *ch = '.';//replace other length field to .
-        }
-        ++ch;
-    }
-    uint16_t req_type = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 12 + strlen(domain) + 1));
-    IF_VERBOSE LOGINF("request dns for:%s with type:%s\n", domain, req_type == 1 ? "A" : "AAAA");
-    if (req_type == 28 && (g_options & OPT_IPV4_ONLY)) {
-    }
-#endif
+    int domain_len = get_domain((const char*)tcpw->buffer, domain);
+    uint16_t req_type = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 12 + domain_len));
+    IF_VERBOSE LOGINF("[%s] request type:%s\n", domain, req_type == 1 ? "A" : "AAAA");
 
     *msglen_ptr = htons(nrecv); /* msg length */
     nrecv += 2; /* msglen + msgbuf */
@@ -564,7 +609,6 @@ static void udp_recvmsg_cb(evloop_t *evloop, evio_t *watcher __attribute__((unus
     ev_io_start(evloop, (evio_t *)tcpw);
     return;
 
-
 CLOSE_TCP_SOCKFD:
     close(sockfd);
 FREE_TCP_WATCHER:
@@ -609,38 +653,6 @@ static void tcp_sendmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attri
     }
 }
 
-bool check_domain_black_list(char* domain) {
-    if (strstr(domain, "disney")) return true;
-    if (strstr(domain, "netflix")) return true;
-    if (strstr(domain, "dssott")) return true;
-    return false;
-}
-
-void remove_unreachable_ipv6_answer(uint8_t* resp_buf) {
-    *(uint16_t*)(resp_buf + 2 + 6) = 0;
-    *(uint16_t*)(resp_buf + 2 + 8) = 0;
-    *(uint16_t*)(resp_buf + 2 + 10) = 0;
-}
-
-bool check_ipv6_addr_reachable(const char* domain, const char* ip) {
-    if (g_fping_timeout > 0) { 
-        char cmd[256] = {0};
-        sprintf(cmd, "fping -c1 -t%d %s > /dev/null 2>&1", g_fping_timeout, ip);
-        int res = system(cmd);
-        if (res == 0){
-            IF_VERBOSE LOGINF("[%s] [%s] is reachable", domain, ip);
-            // do nothing, return the original info
-            return true;
-        } else {
-            IF_VERBOSE LOGINF("[%s] [%s] is not reachable with timeout:%u", domain, ip, g_fping_timeout);
-            return false;
-        } 
-    } else {
-        // do nothing, return the original info
-        IF_VERBOSE LOGINF("fping timeout is 0, skip check");
-        return true;
-    }
-}
 
 static void tcp_recvmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attribute__((unused))) {
     tcpwatcher_t *tcpw = (void *)watcher;
@@ -665,23 +677,16 @@ static void tcp_recvmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attri
     hexdump(tcpw->buffer, nrecv);
 #endif
 
-#if 1
     char domain[256] = {0};
-    strcpy(domain, (const char*)tcpw->buffer + 2 + 12);
-    char* ch = domain + 1;
-    while(*ch != '\0') {
-        if (!isprint(*ch)) {
-            *ch = '.';
-        }
-        ++ch;
-    }
+    int domain_len = get_domain((const char*)tcpw->buffer, domain);
 
     // add one extra char for '\0' after domain name
-    uint16_t req_type = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 12 + strlen(domain) + 1));
+    // and one extra char before the domain, which is the length of first part of domain
+    uint16_t req_type = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 12 + domain_len));
     uint16_t rr_cnt = ntohs(*(uint16_t*)(tcpw->buffer + 2 + 6));
 
     if (req_type == 28) {
-        char* answer = (char*)tcpw->buffer + 2 + 12 + strlen(domain) + 1 + 4;
+        char* answer = (char*)tcpw->buffer + 2 + 12 + domain_len + 4;
         for (int i=0; i<rr_cnt; i++) {
             uint16_t answer_type = ntohs(*(uint16_t*)(answer + 2));
             uint16_t answer_len = ntohs(*(uint16_t*)(answer + 10));
@@ -709,7 +714,8 @@ static void tcp_recvmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attri
                 check_domain_black_list(domain) ||
                 (g_fping_timeout > 0 && !check_ipv6_addr_reachable(domain, ip)))  {
                 IF_VERBOSE LOGINF("[%s] ipv4_only is set or in black list or the ip is unreachable, remove answer", domain);
-                remove_unreachable_ipv6_answer(tcpw->buffer);
+                remove_unreachable_ipv6_answer(tcpw->buffer, answer, answer_len, i);
+                break;
             } 
             answer += (12 + answer_len);
         }
@@ -723,9 +729,6 @@ static void tcp_recvmsg_cb(evloop_t *evloop, evio_t *watcher, int events __attri
     uint16_t msg_len = ntohs(*(uint16_t *)buffer);
     hexdump(tcpw->buffer + 2, msg_len);
 #endif
-
-#endif
-
 
     const void *sendto_skaddr = &tcpw->srcaddr;
     socklen_t sendto_skaddrlen = tcpw->srcaddr.sin6_family == AF_INET ? sizeof(skaddr4_t) : sizeof(skaddr6_t);
