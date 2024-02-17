@@ -501,17 +501,25 @@ bool check_domain_black_list(char* domain) {
 }
 
 void remove_unreachable_ipv6_answer(uint8_t* resp_buf, char* answer, uint16_t answer_len, int answer_idx) {
-    *(uint16_t*)(resp_buf + 2 + 6) = 0;
-    *(uint16_t*)(resp_buf + 2 + 8) = 0;
-    *(uint16_t*)(resp_buf + 2 + 10) = 0;
+    *(uint16_t*)(resp_buf + 2 + 6) = 0; //set Answer RRs to 0;
+    *(uint16_t*)(resp_buf + 2 + 8) = 0; //set Authority RRs to 0;
+    *(uint16_t*)(resp_buf + 2 + 10) = 0;//set Additional RRs to 0;
 
-#if 1
+#if 0 // replace with fack ipv6 address 
+    IF_VERBOSE LOGINF("replace with fake ipv6 ::1");
     *(uint16_t*)(resp_buf + 2 + 6) = (answer_idx + 1) << 8;
     // replace the fake ip ::1
     for (int i=0; i<answer_len; i++) {
         answer[12 + i] = 0;
     }
     answer[12 + answer_len - 1] = 0x01;
+#else // remove answer
+    IF_VERBOSE LOGINF("remove ipv6 answer");
+    *(uint16_t*)(resp_buf + 2 + 6) = (answer_idx + 1) << 8;
+    *(uint16_t*)(resp_buf + 2 + 6) = 0; //set Answer RRs to 0;
+    short buf_len = ntohs(*(uint16_t *)resp_buf) - answer_len; // update buf len after removing the answer
+    *(uint16_t *)resp_buf = htons(buf_len);
+    *answer = 0;
 #endif
 }
 
